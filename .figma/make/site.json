@@ -1,4 +1,5 @@
 {
+  "title": "Mantención Equipos",
   "description": "This app streamlines maintenance for air conditioning operators by displaying equipment lists, tracking status, and guiding inspections with checklists and photo uploads.",
   "robots": {
     "index": false

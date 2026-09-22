@@ -1,15 +1,162 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useAuth } from "./lib/auth";
-import { fetchEquipmentForOperator, fetchReviewPoints, finishMaintenance, type EquipmentView, type ReviewPointView } from "./lib/api";
+import {
+  fetchEquipmentForOperator,
+  fetchReviewPoints,
+  finishMaintenance,
+  fetchMaintenanceDetail,
+  type EquipmentView,
+  type ReviewPointView,
+  type MaintenanceDetail,
+} from "./lib/api";
 import type { PointStatus } from "./lib/database.types";
 
-interface CheckResult {
-  reviewPointId: string;
-  status: "ok" | "warning";
+type CheckStatus = "ok" | "warning";
+
+interface Answer {
+  status: CheckStatus | null;
   comment: string;
 }
 
-type View = "list" | "wizard";
+type Answers = Record<string, Answer>;
+
+// ── persistencia del wizard en curso ────────────────────────────────────────
+// El navegador (sobre todo en el celular) puede recargar la página al volver
+// de otra app — por ejemplo al tomar la foto con la cámara nativa, o si el
+// sistema descarta la pestaña en segundo plano. Esto guarda el progreso para
+// retomarlo automáticamente en vez de perder toda la revisión.
+
+const WIZARD_STORAGE_KEY = "airmaintain:wizard";
+
+interface WizardSnapshot {
+  equipmentId: string;
+  step: "checks" | "photo";
+  currentCheckIndex: number;
+  answers: Answers;
+  startedAt: string;
+}
+
+function loadWizardSnapshot(equipmentId: string): WizardSnapshot | null {
+  try {
+    const raw = sessionStorage.getItem(WIZARD_STORAGE_KEY);
+    if (!raw) return null;
+    const snap = JSON.parse(raw) as WizardSnapshot;
+    return snap.equipmentId === equipmentId ? snap : null;
+  } catch {
+    return null;
+  }
+}
+
+function peekWizardEquipmentId(): string | null {
+  try {
+    const raw = sessionStorage.getItem(WIZARD_STORAGE_KEY);
+    return raw ? ((JSON.parse(raw) as WizardSnapshot).equipmentId ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveWizardSnapshot(snap: WizardSnapshot) {
+  try {
+    sessionStorage.setItem(WIZARD_STORAGE_KEY, JSON.stringify(snap));
+  } catch {
+    // Modo privado u otra restricción del navegador: se pierde el resume, no es crítico.
+  }
+}
+
+function clearWizardSnapshot() {
+  try {
+    sessionStorage.removeItem(WIZARD_STORAGE_KEY);
+  } catch {
+    // noop
+  }
+}
+
+type View = "list" | "wizard" | "detail";
+
+// ── shared components ─────────────────────────────────────────────────────────
+
+const inputCls = "w-full bg-slate-100 border border-slate-300 rounded px-3 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-cyan-500 transition-colors";
+
+function FieldLabel({ children }: { children: React.ReactNode }) {
+  return <label className="text-xs font-mono uppercase tracking-wider text-slate-500 mb-1.5 block">{children}</label>;
+}
+
+function SectionTitle({ children }: { children: React.ReactNode }) {
+  return <h2 className="text-xs font-mono uppercase tracking-widest text-slate-500 mb-3">{children}</h2>;
+}
+
+function Badge({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-xs font-mono font-medium ${className}`}>
+      {children}
+    </span>
+  );
+}
+
+function Btn({
+  children,
+  onClick,
+  variant = "primary",
+  className = "",
+  type = "button",
+  disabled = false,
+}: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  variant?: "primary" | "ghost";
+  className?: string;
+  type?: "button" | "submit";
+  disabled?: boolean;
+}) {
+  const base = "inline-flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium transition-all duration-150 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed";
+  const variants = {
+    primary: "bg-cyan-500 text-slate-900 hover:bg-cyan-400",
+    ghost: "text-slate-500 hover:text-slate-900 hover:bg-slate-100",
+  };
+  return (
+    <button type={type} onClick={onClick} disabled={disabled} className={`${base} ${variants[variant]} ${className}`}>
+      {children}
+    </button>
+  );
+}
+
+function HeroBanner({ subtitle }: { subtitle: string }) {
+  return (
+    <div className="relative mb-6 rounded-2xl overflow-hidden border border-slate-200 shadow-sm">
+      <div className="grid grid-cols-3 h-32 sm:h-44">
+        <img src="/hero/hero-1.jpg" alt="Técnico instalando un split de aire acondicionado" className="w-full h-full object-cover" />
+        <img src="/hero/hero-2.jpg" alt="Técnico revisando la unidad exterior de un aire acondicionado" className="w-full h-full object-cover" />
+        <img src="/hero/hero-3.jpg" alt="Unidad exterior de aire acondicionado" className="w-full h-full object-cover" />
+      </div>
+      <div className="absolute inset-0 bg-gradient-to-t from-slate-900/70 via-slate-900/10 to-transparent" />
+      <div className="absolute bottom-0 left-0 p-4">
+        <h1 className="text-white font-semibold text-xl drop-shadow-sm">Mantención A/C</h1>
+        <p className="text-slate-200 text-sm mt-0.5 drop-shadow-sm capitalize">{subtitle}</p>
+      </div>
+    </div>
+  );
+}
+
+function Shell({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="min-h-full bg-slate-50 text-slate-900" style={{ fontFamily: "'Outfit', system-ui, sans-serif" }}>
+      {children}
+    </div>
+  );
+}
+
+function CenteredMessage({ children }: { children: React.ReactNode }) {
+  return (
+    <Shell>
+      <div className="min-h-screen flex items-center justify-center text-center px-6 text-slate-500 text-sm">
+        <div>{children}</div>
+      </div>
+    </Shell>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
   const { session, profile, clientIds, loading: authLoading, error: authError, signIn, signOut } = useAuth();
@@ -19,32 +166,13 @@ export default function App() {
   if (authError || !profile) {
     return (
       <CenteredMessage>
-        <p className="mb-4">{authError ?? "No se pudo cargar tu perfil."}</p>
-        <button onClick={() => signOut()} className="text-sm underline" style={{ color: "#38bdf8" }}>
-          Cerrar sesión
-        </button>
+        <p className="mb-4 text-red-600">{authError ?? "No se pudo cargar tu perfil."}</p>
+        <Btn variant="ghost" onClick={() => signOut()}>Cerrar sesión</Btn>
       </CenteredMessage>
     );
   }
 
-  return <AuthenticatedApp operatorId={profile.id} operatorInitials={initials(profile.name)} clientIds={clientIds} onSignOut={signOut} />;
-}
-
-function initials(name: string): string {
-  return name
-    .split(" ")
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((p) => p[0]!.toUpperCase())
-    .join("");
-}
-
-function CenteredMessage({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="min-h-full flex items-center justify-center text-center px-6" style={{ background: "#0f1117", color: "#f0f2f8" }}>
-      <div>{children}</div>
-    </div>
-  );
+  return <AuthenticatedApp operatorId={profile.id} operatorEmail={profile.email} clientIds={clientIds} onSignOut={signOut} />;
 }
 
 function LoginScreen({ onSignIn }: { onSignIn: (email: string, password: string) => Promise<void> }) {
@@ -67,58 +195,39 @@ function LoginScreen({ onSignIn }: { onSignIn: (email: string, password: string)
   };
 
   return (
-    <div className="min-h-full flex items-center justify-center px-6" style={{ background: "#0f1117" }}>
-      <form onSubmit={handleSubmit} className="w-full max-w-sm rounded-2xl p-6" style={{ background: "#1a1e2e", border: "1px solid #252d45" }}>
-        <div className="flex items-center gap-2 mb-6">
-          <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "#38bdf8" }}>
-            <SnowflakeIcon className="w-5 h-5" style={{ color: "#0c1520" }} />
+    <Shell>
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <form onSubmit={handleSubmit} className="w-full max-w-sm bg-white border border-slate-200 rounded-xl p-6 flex flex-col gap-4">
+          <div className="mb-2">
+            <span className="font-semibold text-slate-900 text-lg">Mantención A/C</span>
+            <p className="text-xs text-slate-500 mt-0.5">Panel de operadores</p>
           </div>
-          <span className="font-bold text-lg tracking-tight" style={{ fontFamily: "Outfit", color: "#f0f2f8" }}>AirMaintain</span>
-        </div>
-
-        <label className="text-xs font-medium mb-1.5 block" style={{ color: "#6b7a99" }}>Email</label>
-        <input
-          type="email"
-          required
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          className="w-full rounded-xl px-3.5 py-3 text-sm outline-none mb-4"
-          style={{ background: "#0f1117", border: "1px solid #252d45", color: "#f0f2f8" }}
-        />
-
-        <label className="text-xs font-medium mb-1.5 block" style={{ color: "#6b7a99" }}>Contraseña</label>
-        <input
-          type="password"
-          required
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="w-full rounded-xl px-3.5 py-3 text-sm outline-none mb-4"
-          style={{ background: "#0f1117", border: "1px solid #252d45", color: "#f0f2f8" }}
-        />
-
-        {error && <p className="text-sm mb-4" style={{ color: "#f59e0b" }}>{error}</p>}
-
-        <button
-          type="submit"
-          disabled={submitting}
-          className="w-full rounded-xl py-3 font-semibold text-base disabled:opacity-50"
-          style={{ background: "#38bdf8", color: "#0c1520", fontFamily: "Outfit" }}
-        >
-          {submitting ? "Ingresando…" : "Ingresar"}
-        </button>
-      </form>
-    </div>
+          <div>
+            <FieldLabel>Email</FieldLabel>
+            <input type="email" required className={inputCls} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="operador@empresa.com" />
+          </div>
+          <div>
+            <FieldLabel>Contraseña</FieldLabel>
+            <input type="password" required className={inputCls} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
+          </div>
+          {error && <p className="text-sm text-red-600">{error}</p>}
+          <Btn type="submit" disabled={submitting} className="justify-center mt-2">
+            {submitting ? "Ingresando…" : "Ingresar"}
+          </Btn>
+        </form>
+      </div>
+    </Shell>
   );
 }
 
 function AuthenticatedApp({
   operatorId,
-  operatorInitials,
+  operatorEmail,
   clientIds,
   onSignOut,
 }: {
   operatorId: string;
-  operatorInitials: string;
+  operatorEmail: string;
   clientIds: string[];
   onSignOut: () => void;
 }) {
@@ -145,18 +254,36 @@ function AuthenticatedApp({
     reload();
   }, [reload]);
 
+  // Si la página se recargó con una revisión en curso (la app quedó en
+  // segundo plano y el navegador la descartó), retoma automáticamente ese
+  // equipo en vez de mostrar la lista como si nada.
+  useEffect(() => {
+    if (view !== "list" || loadingEquipment) return;
+    const savedId = peekWizardEquipmentId();
+    if (!savedId) return;
+    const eq = equipmentList.find((e) => e.id === savedId && e.status === "pending");
+    if (eq) {
+      setSelectedEquipment(eq);
+      setView("wizard");
+    } else {
+      clearWizardSnapshot();
+    }
+  }, [view, loadingEquipment, equipmentList]);
+
   const handleSelect = (eq: EquipmentView) => {
     setSelectedEquipment(eq);
-    setView("wizard");
+    setView(eq.status === "pending" ? "wizard" : "detail");
   };
 
   const handleComplete = async () => {
+    clearWizardSnapshot();
     setView("list");
     setSelectedEquipment(null);
     await reload();
   };
 
   const handleBack = () => {
+    clearWizardSnapshot();
     setView("list");
     setSelectedEquipment(null);
   };
@@ -165,27 +292,31 @@ function AuthenticatedApp({
     return <WizardView equipment={selectedEquipment} operatorId={operatorId} onComplete={handleComplete} onBack={handleBack} />;
   }
 
+  if (view === "detail" && selectedEquipment) {
+    return <DetailView equipment={selectedEquipment} onBack={handleBack} />;
+  }
+
   if (loadingEquipment) return <CenteredMessage>Cargando equipos…</CenteredMessage>;
   if (loadError) {
     return (
       <CenteredMessage>
-        <p className="mb-4">{loadError}</p>
-        <button onClick={reload} className="text-sm underline" style={{ color: "#38bdf8" }}>Reintentar</button>
+        <p className="mb-4 text-red-600">{loadError}</p>
+        <Btn variant="ghost" onClick={reload}>Reintentar</Btn>
       </CenteredMessage>
     );
   }
 
-  return <ListView equipmentList={equipmentList} operatorInitials={operatorInitials} onSelect={handleSelect} onSignOut={onSignOut} />;
+  return <ListView equipmentList={equipmentList} operatorEmail={operatorEmail} onSelect={handleSelect} onSignOut={onSignOut} />;
 }
 
 function ListView({
   equipmentList,
-  operatorInitials,
+  operatorEmail,
   onSelect,
   onSignOut,
 }: {
   equipmentList: EquipmentView[];
-  operatorInitials: string;
+  operatorEmail: string;
   onSelect: (eq: EquipmentView) => void;
   onSignOut: () => void;
 }) {
@@ -194,91 +325,63 @@ function ListView({
   const today = new Date().toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long" });
 
   return (
-    <div className="min-h-full" style={{ background: "#0f1117" }}>
-      <div className="sticky top-0 z-10" style={{ background: "#0f1117", borderBottom: "1px solid #252d45" }}>
-        <div className="px-4 pt-5 pb-4">
-          <div className="flex items-center justify-between mb-1">
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "#38bdf8" }}>
-                <SnowflakeIcon className="w-5 h-5" style={{ color: "#0c1520" }} />
-              </div>
-              <span className="font-bold text-lg tracking-tight" style={{ fontFamily: "Outfit", color: "#f0f2f8" }}>
-                AirMaintain
-              </span>
-            </div>
-            <button
-              onClick={onSignOut}
-              className="w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold"
-              style={{ background: "#1e2540", color: "#38bdf8" }}
-              title="Cerrar sesión"
-            >
-              {operatorInitials}
-            </button>
+    <Shell>
+      <header className="sticky top-0 z-10 bg-slate-50/90 backdrop-blur border-b border-slate-200">
+        <div className="max-w-2xl mx-auto px-4 py-3 flex items-center gap-3">
+          <span className="font-semibold text-slate-900 text-sm">Mantención A/C</span>
+          <div className="ml-auto flex items-center gap-3">
+            <span className="text-xs text-slate-500 hidden sm:inline">{operatorEmail}</span>
+            <Btn variant="ghost" onClick={onSignOut} className="text-xs">Cerrar sesión</Btn>
           </div>
-          <p className="text-xs mt-1 capitalize" style={{ color: "#6b7a99" }}>
-            {today}
-          </p>
+        </div>
+      </header>
+
+      <main className="max-w-2xl mx-auto px-4 py-6">
+        <HeroBanner subtitle={today} />
+
+        <div className="grid grid-cols-3 gap-3 mb-8">
+          <StatCard label="Total" value={equipmentList.length} valueClass="text-slate-900" />
+          <StatCard label="Pendientes" value={pending.length} valueClass="text-amber-600" />
+          <StatCard label="Realizados" value={done.length} valueClass="text-emerald-600" />
         </div>
 
-        <div className="px-4 pb-4 grid grid-cols-3 gap-3">
-          <StatCard label="Total" value={equipmentList.length} color="#38bdf8" />
-          <StatCard label="Pendientes" value={pending.length} color="#f59e0b" />
-          <StatCard label="Realizados" value={done.length} color="#22c55e" />
-        </div>
-      </div>
-
-      <div className="px-4 pb-8">
         {pending.length === 0 && done.length === 0 && (
-          <div className="mt-8 text-center text-sm" style={{ color: "#6b7a99" }}>
+          <p className="text-center text-sm text-slate-500 py-8">
             No hay equipos con mantención vigente para tus clientes asignados.
-          </div>
+          </p>
         )}
 
         {pending.length > 0 && (
-          <div className="mt-5">
-            <SectionHeader label="Pendientes" count={pending.length} dot="#f59e0b" />
-            <div className="mt-3 flex flex-col gap-3">
+          <section className="mb-8">
+            <SectionTitle>Pendientes · {pending.length}</SectionTitle>
+            <div className="flex flex-col gap-3">
               {pending.map((eq) => (
                 <EquipmentCard key={eq.id} equipment={eq} onSelect={onSelect} />
               ))}
             </div>
-          </div>
+          </section>
         )}
 
         {done.length > 0 && (
-          <div className="mt-7">
-            <SectionHeader label="Realizados" count={done.length} dot="#22c55e" />
-            <div className="mt-3 flex flex-col gap-3">
+          <section>
+            <SectionTitle>Realizados · {done.length}</SectionTitle>
+            <div className="flex flex-col gap-3">
               {done.map((eq) => (
                 <EquipmentCard key={eq.id} equipment={eq} onSelect={onSelect} />
               ))}
             </div>
-          </div>
+          </section>
         )}
-      </div>
-    </div>
+      </main>
+    </Shell>
   );
 }
 
-function StatCard({ label, value, color }: { label: string; value: number; color: string }) {
+function StatCard({ label, value, valueClass }: { label: string; value: number; valueClass: string }) {
   return (
-    <div className="rounded-xl px-3 py-2.5 text-center" style={{ background: "#1a1e2e", border: "1px solid #252d45" }}>
-      <div className="text-2xl font-bold" style={{ fontFamily: "Outfit", color }}>{value}</div>
-      <div className="text-xs mt-0.5" style={{ color: "#6b7a99" }}>{label}</div>
-    </div>
-  );
-}
-
-function SectionHeader({ label, count, dot }: { label: string; count: number; dot: string }) {
-  return (
-    <div className="flex items-center gap-2">
-      <div className="w-2 h-2 rounded-full" style={{ background: dot }} />
-      <span className="text-sm font-semibold" style={{ fontFamily: "Outfit", color: "#94a3c0" }}>
-        {label}
-      </span>
-      <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: "#1e2540", color: "#6b7a99" }}>
-        {count}
-      </span>
+    <div className="bg-white border border-slate-200 rounded-xl px-3 py-3 text-center">
+      <div className={`text-2xl font-semibold ${valueClass}`}>{value}</div>
+      <div className="text-xs font-mono uppercase tracking-wider text-slate-500 mt-0.5">{label}</div>
     </div>
   );
 }
@@ -291,60 +394,40 @@ function EquipmentCard({ equipment: eq, onSelect }: { equipment: EquipmentView; 
 
   return (
     <button
-      onClick={() => isPending && onSelect(eq)}
-      className="w-full text-left rounded-2xl p-4 transition-all duration-150"
-      style={{
-        background: "#1a1e2e",
-        border: `1px solid ${isPending ? "#252d45" : "#1e2d1e"}`,
-        opacity: isPending ? 1 : 0.75,
-        cursor: isPending ? "pointer" : "default",
-      }}
+      onClick={() => onSelect(eq)}
+      className={`w-full text-left bg-white border border-slate-200 rounded-xl p-4 transition-all duration-150 hover:border-slate-400 cursor-pointer ${
+        isPending ? "" : "opacity-75"
+      }`}
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-xs font-mono px-2 py-0.5 rounded-md" style={{ background: "#0f1117", color: "#38bdf8", border: "1px solid #252d45" }}>
-              {eq.code}
-            </span>
-            {!isPending && (
-              <span className="text-xs px-2 py-0.5 rounded-md font-medium" style={{ background: eq.hasWarnings ? "#2d1f0a" : "#0d2618", color: eq.hasWarnings ? "#f59e0b" : "#22c55e" }}>
-                {eq.hasWarnings ? "Con advertencias" : "OK"}
-              </span>
+          <div className="flex items-center gap-2 mb-1.5">
+            <Badge className="text-slate-600 bg-slate-100 border-slate-200">{eq.code}</Badge>
+            {isPending ? (
+              <Badge className="text-amber-600 bg-amber-50 border-amber-200">Pendiente</Badge>
+            ) : (
+              <Badge className={eq.hasWarnings ? "text-amber-600 bg-amber-50 border-amber-200" : "text-emerald-600 bg-emerald-50 border-emerald-200"}>
+                {eq.hasWarnings ? "Con advertencias" : "Realizado · OK"}
+              </Badge>
             )}
           </div>
-          <div className="font-semibold text-base leading-tight" style={{ fontFamily: "Outfit", color: "#f0f2f8" }}>
-            {eq.description}
-          </div>
-          <div className="text-sm mt-0.5" style={{ color: "#6b7a99" }}>
+          <div className="font-semibold text-slate-900 leading-tight">{eq.description}</div>
+          <div className="text-sm text-slate-500 mt-0.5">
             {eq.brand} · {eq.model}
           </div>
-          <div className="flex items-center gap-1.5 mt-2">
-            <LocationIcon className="w-3.5 h-3.5 flex-shrink-0" style={{ color: "#6b7a99" }} />
-            <span className="text-sm truncate" style={{ color: "#94a3c0" }}>{eq.location}</span>
+          <div className="flex items-center gap-1.5 mt-2 text-sm text-slate-600">
+            <LocationIcon className="w-3.5 h-3.5 flex-shrink-0 text-slate-400" />
+            <span className="truncate">{eq.location}</span>
           </div>
           {!isPending && completedAtLabel && (
-            <div className="flex items-center gap-1.5 mt-1">
-              <CheckCircleIcon className="w-3.5 h-3.5 flex-shrink-0" style={{ color: "#22c55e" }} />
-              <span className="text-xs" style={{ color: "#22c55e" }}>Completado {completedAtLabel}</span>
+            <div className="flex items-center gap-1.5 mt-1 text-xs text-emerald-600">
+              <CheckCircleIcon className="w-3.5 h-3.5 flex-shrink-0" />
+              <span>Completado {completedAtLabel}</span>
             </div>
           )}
         </div>
-        <div className="flex-shrink-0 flex flex-col items-center gap-1 mt-1">
-          {isPending ? (
-            <>
-              <div className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: "#38bdf8" }}>
-                <ChevronRightIcon className="w-5 h-5" style={{ color: "#0c1520" }} />
-              </div>
-              <span className="text-xs" style={{ color: "#f59e0b" }}>Pendiente</span>
-            </>
-          ) : (
-            <>
-              <div className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: "#0d2618" }}>
-                <CheckCircleIcon className="w-5 h-5" style={{ color: "#22c55e" }} />
-              </div>
-              <span className="text-xs" style={{ color: "#22c55e" }}>Listo</span>
-            </>
-          )}
+        <div className={`flex-shrink-0 w-9 h-9 rounded-lg flex items-center justify-center mt-1 ${isPending ? "bg-cyan-500" : "bg-slate-100 border border-slate-200"}`}>
+          <ChevronRightIcon className={`w-5 h-5 ${isPending ? "text-slate-900" : "text-slate-400"}`} />
         </div>
       </div>
     </button>
@@ -352,6 +435,106 @@ function EquipmentCard({ equipment: eq, onSelect }: { equipment: EquipmentView; 
 }
 
 // ─── Wizard ───────────────────────────────────────────────────────────────────
+
+// ─── Detalle de una revisión ya realizada (solo lectura) ──────────────────────
+
+function DetailView({ equipment, onBack }: { equipment: EquipmentView; onBack: () => void }) {
+  const [detail, setDetail] = useState<MaintenanceDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!equipment.maintenanceId) {
+      setError("Esta revisión no tiene un registro asociado.");
+      return;
+    }
+    let cancelled = false;
+    fetchMaintenanceDetail(equipment.maintenanceId)
+      .then((d) => {
+        if (!cancelled) setDetail(d);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "No se pudo cargar la revisión.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [equipment.maintenanceId]);
+
+  const completedAtLabel = detail?.completedAt
+    ? new Date(detail.completedAt).toLocaleDateString("es-CL") + " " + new Date(detail.completedAt).toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })
+    : null;
+
+  return (
+    <Shell>
+      <header className="sticky top-0 z-10 bg-slate-50/90 backdrop-blur border-b border-slate-200">
+        <div className="max-w-2xl mx-auto px-4 py-3">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onBack}
+              className="w-9 h-9 rounded-lg bg-white border border-slate-200 hover:border-slate-400 flex items-center justify-center cursor-pointer transition-colors"
+              aria-label="Volver"
+            >
+              <ChevronLeftIcon className="w-5 h-5 text-slate-700" />
+            </button>
+            <div className="flex-1 min-w-0">
+              <Badge className="text-slate-600 bg-slate-100 border-slate-200">{equipment.code}</Badge>
+              <div className="font-semibold text-slate-900 leading-tight truncate mt-1">{equipment.description}</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 mt-2 text-xs text-slate-500">
+            <LocationIcon className="w-3.5 h-3.5 text-slate-400" />
+            <span>{equipment.location}</span>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-2xl mx-auto px-4 py-6 flex flex-col gap-6">
+        {error && <p className="text-sm text-center text-red-600 py-8">{error}</p>}
+
+        {!error && !detail && <div className="text-center py-16 text-slate-500 text-sm font-mono">Cargando revisión…</div>}
+
+        {detail && (
+          <>
+            <div className="bg-white border border-slate-200 rounded-xl p-4">
+              <div className="flex items-center justify-between">
+                <SectionTitle>Revisión completada</SectionTitle>
+                {detail.overallResult && (
+                  <Badge className={detail.overallResult === "ok" ? "text-emerald-600 bg-emerald-50 border-emerald-200" : "text-amber-600 bg-amber-50 border-amber-200"}>
+                    {detail.overallResult === "ok" ? "OK" : detail.overallResult === "warning" ? "Con advertencias" : "Crítico"}
+                  </Badge>
+                )}
+              </div>
+              {completedAtLabel && <p className="text-sm text-slate-500 mt-1">Completado {completedAtLabel}</p>}
+            </div>
+
+            {detail.photoUrl && (
+              <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                <img src={detail.photoUrl} alt="Foto del equipo" className="w-full object-cover" style={{ maxHeight: 320 }} />
+              </div>
+            )}
+
+            <div>
+              <SectionTitle>Puntos revisados</SectionTitle>
+              <div className="flex flex-col gap-2">
+                {detail.items.map((item) => (
+                  <div key={item.reviewPointId} className="bg-white border border-slate-200 rounded-lg p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-sm font-medium text-slate-900">{item.label}</span>
+                      <Badge className={item.status === "ok" ? "text-emerald-600 bg-emerald-50 border-emerald-200" : "text-amber-600 bg-amber-50 border-amber-200"}>
+                        {item.status === "ok" ? "OK" : item.status === "warning" ? "Advertencia" : "Crítico"}
+                      </Badge>
+                    </div>
+                    {item.comment && <p className="text-sm text-slate-500 mt-1">{item.comment}</p>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+      </main>
+    </Shell>
+  );
+}
 
 type WizardStep = "loading" | "checks" | "photo" | "error";
 
@@ -366,17 +549,17 @@ function WizardView({
   onComplete: () => void;
   onBack: () => void;
 }) {
+  const initialSnapshot = loadWizardSnapshot(equipment.id);
   const [step, setStep] = useState<WizardStep>("loading");
   const [reviewPoints, setReviewPoints] = useState<ReviewPointView[]>([]);
-  const [currentCheckIndex, setCurrentCheckIndex] = useState(0);
-  const [results, setResults] = useState<CheckResult[]>([]);
+  const [currentCheckIndex, setCurrentCheckIndex] = useState(initialSnapshot?.currentCheckIndex ?? 0);
+  const [answers, setAnswers] = useState<Answers>(initialSnapshot?.answers ?? {});
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [photoPreviewUrl, setPhotoPreviewUrl] = useState<string>("");
-  const [comment, setComment] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const startedAtRef = useRef(new Date());
+  const startedAtRef = useRef(initialSnapshot ? new Date(initialSnapshot.startedAt) : new Date());
 
   useEffect(() => {
     let cancelled = false;
@@ -384,7 +567,7 @@ function WizardView({
       .then((points) => {
         if (cancelled) return;
         setReviewPoints(points);
-        setStep("checks");
+        setStep(initialSnapshot?.step === "photo" ? "photo" : "checks");
       })
       .catch((err) => {
         if (cancelled) return;
@@ -394,23 +577,58 @@ function WizardView({
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [equipment.equipmentTypeId]);
 
+  // Guarda el progreso a cada cambio, para poder retomarlo si la página se recarga sola.
+  useEffect(() => {
+    if (step !== "checks" && step !== "photo") return;
+    saveWizardSnapshot({
+      equipmentId: equipment.id,
+      step,
+      currentCheckIndex,
+      answers,
+      startedAt: startedAtRef.current.toISOString(),
+    });
+  }, [equipment.id, step, currentCheckIndex, answers]);
+
   const currentCheck = reviewPoints[currentCheckIndex];
-  const progress = reviewPoints.length ? (currentCheckIndex / reviewPoints.length) * 100 : 0;
+  const answeredCount = reviewPoints.filter((p) => answers[p.id]?.status).length;
+  const progress = reviewPoints.length ? (answeredCount / reviewPoints.length) * 100 : 0;
+  const missingMandatory = reviewPoints.filter((p) => p.mandatory && !answers[p.id]?.status);
+  const isLast = currentCheckIndex === reviewPoints.length - 1;
 
-  const handleCheckResult = (status: "ok" | "warning") => {
-    const result: CheckResult = { reviewPointId: currentCheck.id, status, comment };
-    const newResults = [...results, result];
-    setResults(newResults);
-    setComment("");
+  const [commentRequiredError, setCommentRequiredError] = useState(false);
 
-    if (currentCheckIndex < reviewPoints.length - 1) {
-      setCurrentCheckIndex(currentCheckIndex + 1);
-    } else {
-      setStep("photo");
-    }
+  const updateAnswer = (patch: Partial<Answer>) => {
+    setAnswers((prev) => ({
+      ...prev,
+      [currentCheck.id]: { ...(prev[currentCheck.id] ?? { status: null, comment: "" }), ...patch },
+    }));
   };
+
+  const handleStatus = (status: CheckStatus) => {
+    const current = answers[currentCheck.id];
+    if (current?.status === status) {
+      updateAnswer({ status: null });
+      setCommentRequiredError(false);
+      return;
+    }
+    if (status === "warning" && currentCheck.commentsAllowed && !current?.comment?.trim()) {
+      setCommentRequiredError(true);
+      return;
+    }
+    setCommentRequiredError(false);
+    updateAnswer({ status });
+    if (!isLast) setCurrentCheckIndex(currentCheckIndex + 1);
+  };
+
+  const goToIndex = (index: number) => {
+    setCommentRequiredError(false);
+    setCurrentCheckIndex(index);
+  };
+  const goPrev = () => goToIndex(Math.max(0, currentCheckIndex - 1));
+  const goNext = () => goToIndex(Math.min(reviewPoints.length - 1, currentCheckIndex + 1));
 
   const handlePhotoCapture = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -428,7 +646,9 @@ function WizardView({
         equipmentId: equipment.id,
         operatorId,
         startedAt: startedAtRef.current,
-        items: results.map((r) => ({ reviewPointId: r.reviewPointId, status: r.status as PointStatus, comment: r.comment })),
+        items: reviewPoints
+          .filter((p) => answers[p.id]?.status)
+          .map((p) => ({ reviewPointId: p.id, status: answers[p.id].status as PointStatus, comment: answers[p.id].comment })),
         reviewPoints,
         photoFile,
       });
@@ -440,50 +660,62 @@ function WizardView({
   };
 
   return (
-    <div className="min-h-full flex flex-col" style={{ background: "#0f1117" }}>
-      <div className="sticky top-0 z-10" style={{ background: "#0f1117", borderBottom: "1px solid #252d45" }}>
-        <div className="px-4 pt-5 pb-3">
+    <Shell>
+      <header className="sticky top-0 z-10 bg-slate-50/90 backdrop-blur border-b border-slate-200">
+        <div className="max-w-2xl mx-auto px-4 py-3">
           <div className="flex items-center gap-3">
-            <button onClick={onBack} className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: "#1a1e2e", border: "1px solid #252d45" }}>
-              <ChevronLeftIcon className="w-5 h-5" style={{ color: "#f0f2f8" }} />
+            <button
+              onClick={onBack}
+              className="w-9 h-9 rounded-lg bg-white border border-slate-200 hover:border-slate-400 flex items-center justify-center cursor-pointer transition-colors"
+              aria-label="Volver"
+            >
+              <ChevronLeftIcon className="w-5 h-5 text-slate-700" />
             </button>
             <div className="flex-1 min-w-0">
-              <div className="text-xs font-mono" style={{ color: "#38bdf8" }}>{equipment.code}</div>
-              <div className="font-bold text-base leading-tight truncate" style={{ fontFamily: "Outfit", color: "#f0f2f8" }}>{equipment.description}</div>
+              <Badge className="text-slate-600 bg-slate-100 border-slate-200">{equipment.code}</Badge>
+              <div className="font-semibold text-slate-900 leading-tight truncate mt-1">{equipment.description}</div>
             </div>
           </div>
-          <div className="flex items-center gap-2 mt-3">
-            <LocationIcon className="w-3.5 h-3.5" style={{ color: "#6b7a99" }} />
-            <span className="text-xs" style={{ color: "#94a3c0" }}>{equipment.location}</span>
+          <div className="flex items-center gap-1.5 mt-2 text-xs text-slate-500">
+            <LocationIcon className="w-3.5 h-3.5 text-slate-400" />
+            <span>{equipment.location}</span>
           </div>
 
           {step !== "loading" && step !== "error" && (
             <div className="flex items-center gap-2 mt-4">
               <StepDot active={step === "checks"} done={step === "photo"} label="Revisión" />
-              <div className="flex-1 h-px" style={{ background: step === "photo" ? "#38bdf8" : "#252d45" }} />
+              <div className={`flex-1 h-px ${step === "photo" ? "bg-cyan-500" : "bg-slate-300"}`} />
               <StepDot active={step === "photo"} done={false} label="Foto" />
             </div>
           )}
         </div>
-      </div>
+      </header>
 
-      <div className="flex-1 overflow-y-auto">
-        {step === "loading" && <CenteredMessage>Cargando puntos de revisión…</CenteredMessage>}
+      <main className="max-w-2xl mx-auto">
+        {step === "loading" && <div className="text-center py-16 text-slate-500 text-sm font-mono">Cargando puntos de revisión…</div>}
         {step === "error" && (
-          <CenteredMessage>
-            <p className="mb-4">{error}</p>
-            <button onClick={onBack} className="text-sm underline" style={{ color: "#38bdf8" }}>Volver</button>
-          </CenteredMessage>
+          <div className="text-center py-16 px-4">
+            <p className="mb-4 text-red-600 text-sm">{error}</p>
+            <Btn variant="ghost" onClick={onBack}>Volver</Btn>
+          </div>
         )}
         {step === "checks" && currentCheck && (
           <CheckStep
             checkpoints={reviewPoints}
             currentIndex={currentCheckIndex}
             progress={progress}
-            comment={comment}
-            onCommentChange={setComment}
-            onResult={handleCheckResult}
-            results={results}
+            answers={answers}
+            missingMandatory={missingMandatory.length}
+            commentRequiredError={commentRequiredError}
+            onCommentChange={(comment) => {
+              updateAnswer({ comment });
+              setCommentRequiredError(false);
+            }}
+            onStatus={handleStatus}
+            onPrev={goPrev}
+            onNext={goNext}
+            onJump={goToIndex}
+            onContinue={() => setStep("photo")}
           />
         )}
         {step === "photo" && (
@@ -492,14 +724,16 @@ function WizardView({
             fileInputRef={fileInputRef}
             onPhotoCapture={handlePhotoCapture}
             onFileInputClick={() => fileInputRef.current?.click()}
-            results={results}
+            answers={answers}
+            total={reviewPoints.length}
+            onBack={() => setStep("checks")}
             onFinish={handleFinish}
             submitting={submitting}
             error={error}
           />
         )}
-      </div>
-    </div>
+      </main>
+    </Shell>
   );
 }
 
@@ -507,114 +741,159 @@ function StepDot({ active, done, label }: { active: boolean; done: boolean; labe
   return (
     <div className="flex flex-col items-center gap-1">
       <div
-        className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold transition-colors"
-        style={{
-          background: done ? "#22c55e" : active ? "#38bdf8" : "#1e2540",
-          color: done || active ? "#0c1520" : "#6b7a99",
-        }}
+        className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold transition-colors ${
+          done ? "bg-emerald-500 text-white" : active ? "bg-cyan-500 text-slate-900" : "bg-slate-200 text-slate-500"
+        }`}
       >
         {done ? "✓" : ""}
       </div>
-      <span className="text-xs" style={{ color: active ? "#38bdf8" : done ? "#22c55e" : "#6b7a99" }}>{label}</span>
+      <span className={`text-xs font-mono uppercase tracking-wider ${active ? "text-cyan-600" : done ? "text-emerald-600" : "text-slate-500"}`}>{label}</span>
     </div>
   );
 }
 
 function CheckStep({
-  checkpoints, currentIndex, progress, comment, onCommentChange, onResult, results
+  checkpoints, currentIndex, progress, answers, missingMandatory, commentRequiredError, onCommentChange, onStatus, onPrev, onNext, onJump, onContinue
 }: {
   checkpoints: ReviewPointView[];
   currentIndex: number;
   progress: number;
-  comment: string;
+  answers: Answers;
+  missingMandatory: number;
+  commentRequiredError: boolean;
   onCommentChange: (v: string) => void;
-  onResult: (status: "ok" | "warning") => void;
-  results: CheckResult[];
+  onStatus: (status: CheckStatus) => void;
+  onPrev: () => void;
+  onNext: () => void;
+  onJump: (index: number) => void;
+  onContinue: () => void;
 }) {
   const check = checkpoints[currentIndex];
+  const answer = answers[check.id];
+  const isFirst = currentIndex === 0;
+  const isLast = currentIndex === checkpoints.length - 1;
+  const answeredCount = checkpoints.filter((p) => answers[p.id]?.status).length;
+
+  const statusBtn = (status: CheckStatus) => {
+    const selected = answer?.status === status;
+    const palette =
+      status === "ok"
+        ? selected
+          ? "bg-emerald-500 border-emerald-500 text-white"
+          : "bg-emerald-50 border-emerald-200 text-emerald-600 hover:bg-emerald-100"
+        : selected
+          ? "bg-amber-500 border-amber-500 text-white"
+          : "bg-amber-50 border-amber-200 text-amber-600 hover:bg-amber-100";
+    return (
+      <button
+        onClick={() => onStatus(status)}
+        className={`rounded-lg py-3.5 font-semibold flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer border ${palette}`}
+      >
+        {status === "ok" ? <CheckCircleIcon className="w-5 h-5" /> : <WarningIcon className="w-5 h-5" />}
+        {status === "ok" ? "OK" : "Advertencia"}
+      </button>
+    );
+  };
 
   return (
-    <div className="px-4 py-5 flex flex-col gap-5">
+    <div className="px-4 py-6 flex flex-col gap-6">
       <div>
         <div className="flex items-center justify-between mb-2">
-          <span className="text-xs" style={{ color: "#6b7a99" }}>Punto {currentIndex + 1} de {checkpoints.length}</span>
-          <span className="text-xs font-medium" style={{ color: "#38bdf8" }}>{Math.round(progress)}%</span>
+          <span className="text-xs font-mono uppercase tracking-wider text-slate-500">
+            Punto {currentIndex + 1} de {checkpoints.length} · {answeredCount} revisados
+          </span>
+          <span className="text-xs font-mono text-cyan-600">{Math.round(progress)}%</span>
         </div>
-        <div className="w-full h-2 rounded-full" style={{ background: "#1e2540" }}>
-          <div
-            className="h-2 rounded-full transition-all duration-300"
-            style={{ width: `${progress}%`, background: "linear-gradient(90deg, #38bdf8, #22d3ee)" }}
-          />
+        <div className="w-full h-1.5 rounded-full bg-slate-200">
+          <div className="h-1.5 rounded-full bg-cyan-500 transition-all duration-300" style={{ width: `${progress}%` }} />
         </div>
       </div>
 
-      <div className="rounded-2xl p-5" style={{ background: "#1a1e2e", border: "1px solid #252d45" }}>
+      <div className="bg-white border border-slate-200 rounded-xl p-5">
         <div className="flex items-start gap-3 mb-4">
-          <div className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: "#0f1117", border: "1px solid #252d45" }}>
-            <WrenchIcon className="w-5 h-5" style={{ color: "#38bdf8" }} />
+          <div className="w-10 h-10 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center flex-shrink-0">
+            <WrenchIcon className="w-5 h-5 text-cyan-600" />
           </div>
           <div>
-            <div className="font-bold text-lg" style={{ fontFamily: "Outfit", color: "#f0f2f8" }}>{check.label}</div>
-            <div className="text-sm mt-1 leading-relaxed" style={{ color: "#94a3c0" }}>{check.description}</div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-semibold text-lg text-slate-900">{check.label}</span>
+              {check.mandatory && <Badge className="text-slate-500 bg-slate-100 border-slate-200">Obligatorio</Badge>}
+            </div>
+            <div className="text-sm mt-1 leading-relaxed text-slate-500">{check.description}</div>
           </div>
         </div>
 
         {check.commentsAllowed && (
           <div className="mb-4">
-            <label className="text-xs font-medium mb-1.5 block" style={{ color: "#6b7a99" }}>Comentario (opcional)</label>
+            <FieldLabel>Comentario {answer?.status === "warning" ? "(obligatorio con advertencia)" : "(opcional)"}</FieldLabel>
             <textarea
               rows={2}
-              value={comment}
+              value={answer?.comment ?? ""}
               onChange={(e) => onCommentChange(e.target.value)}
               placeholder="Describe lo observado..."
-              className="w-full rounded-xl px-3.5 py-3 text-sm resize-none outline-none transition-colors"
-              style={{
-                background: "#0f1117",
-                border: "1px solid #252d45",
-                color: "#f0f2f8",
-                fontFamily: "Inter",
-              }}
-              onFocus={(e) => (e.currentTarget.style.borderColor = "#38bdf8")}
-              onBlur={(e) => (e.currentTarget.style.borderColor = "#252d45")}
+              className={`${inputCls} resize-none ${commentRequiredError ? "border-amber-400 focus:border-amber-500" : ""}`}
             />
+            {commentRequiredError && (
+              <p className="text-xs text-amber-600 mt-1.5">Escribe un comentario antes de marcar Advertencia.</p>
+            )}
           </div>
         )}
 
         <div className="grid grid-cols-2 gap-3">
-          <button
-            onClick={() => onResult("warning")}
-            className="rounded-xl py-4 font-semibold text-base flex items-center justify-center gap-2 transition-all active:scale-95"
-            style={{ background: "#2d1f0a", border: "1px solid #92400e", color: "#f59e0b", fontFamily: "Outfit" }}
-          >
-            <WarningIcon className="w-5 h-5" />
-            Advertencia
-          </button>
-          <button
-            onClick={() => onResult("ok")}
-            className="rounded-xl py-4 font-semibold text-base flex items-center justify-center gap-2 transition-all active:scale-95"
-            style={{ background: "#0d2618", border: "1px solid #166534", color: "#22c55e", fontFamily: "Outfit" }}
-          >
-            <CheckCircleIcon className="w-5 h-5" />
-            OK
-          </button>
+          {statusBtn("warning")}
+          {statusBtn("ok")}
+        </div>
+
+        <div className="flex items-center justify-between mt-4 pt-4 border-t border-slate-200">
+          <Btn variant="ghost" onClick={onPrev} disabled={isFirst}>
+            <ChevronLeftIcon className="w-4 h-4" />
+            Anterior
+          </Btn>
+          <Btn variant="ghost" onClick={onNext} disabled={isLast}>
+            {answer?.status ? "Siguiente" : "Saltar"}
+            <ChevronRightIcon className="w-4 h-4" />
+          </Btn>
         </div>
       </div>
 
-      {results.length > 0 && (
-        <div>
-          <div className="text-xs font-medium mb-2" style={{ color: "#6b7a99" }}>Revisados anteriormente</div>
-          <div className="flex flex-col gap-2">
-            {results.map((r, i) => (
-              <div key={r.reviewPointId} className="flex items-center justify-between px-3 py-2 rounded-xl" style={{ background: "#1a1e2e", border: "1px solid #252d45" }}>
-                <span className="text-sm" style={{ color: "#94a3c0" }}>{checkpoints[i].label}</span>
-                <span className="text-xs font-semibold px-2 py-0.5 rounded-lg" style={{ background: r.status === "ok" ? "#0d2618" : "#2d1f0a", color: r.status === "ok" ? "#22c55e" : "#f59e0b" }}>
-                  {r.status === "ok" ? "OK" : "Advertencia"}
-                </span>
-              </div>
-            ))}
-          </div>
+      <div>
+        <SectionTitle>Todos los puntos</SectionTitle>
+        <div className="flex flex-col gap-2">
+          {checkpoints.map((p, i) => {
+            const st = answers[p.id]?.status;
+            return (
+              <button
+                key={p.id}
+                onClick={() => onJump(i)}
+                className={`flex items-center justify-between px-3 py-2 rounded-lg bg-white border text-left cursor-pointer transition-colors ${
+                  i === currentIndex ? "border-cyan-500" : "border-slate-200 hover:border-slate-400"
+                }`}
+              >
+                <span className="text-sm text-slate-600">{i + 1}. {p.label}</span>
+                {st ? (
+                  <Badge className={st === "ok" ? "text-emerald-600 bg-emerald-50 border-emerald-200" : "text-amber-600 bg-amber-50 border-amber-200"}>
+                    {st === "ok" ? "OK" : "Advertencia"}
+                  </Badge>
+                ) : (
+                  <Badge className="text-slate-400 bg-slate-50 border-slate-200">Sin revisar</Badge>
+                )}
+              </button>
+            );
+          })}
         </div>
-      )}
+      </div>
+
+      <div>
+        {missingMandatory > 0 && (
+          <p className="text-xs text-amber-600 mb-2 text-center">
+            Faltan {missingMandatory} punto{missingMandatory > 1 ? "s" : ""} obligatorio{missingMandatory > 1 ? "s" : ""} por revisar.
+          </p>
+        )}
+        <Btn onClick={onContinue} disabled={missingMandatory > 0} className="w-full justify-center py-3 text-base">
+          Continuar a la foto
+          <ChevronRightIcon className="w-5 h-5" />
+        </Btn>
+      </div>
     </div>
   );
 }
@@ -624,7 +903,9 @@ function PhotoStep({
   fileInputRef,
   onPhotoCapture,
   onFileInputClick,
-  results,
+  answers,
+  total,
+  onBack,
   onFinish,
   submitting,
   error,
@@ -633,44 +914,52 @@ function PhotoStep({
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   onPhotoCapture: (e: React.ChangeEvent<HTMLInputElement>) => void;
   onFileInputClick: () => void;
-  results: CheckResult[];
+  answers: Answers;
+  total: number;
+  onBack: () => void;
   onFinish: () => void;
   submitting: boolean;
   error: string | null;
 }) {
-  const warnings = results.filter((r) => r.status === "warning").length;
-  const oks = results.filter((r) => r.status === "ok").length;
+  const statuses = Object.values(answers).map((a) => a.status);
+  const warnings = statuses.filter((s) => s === "warning").length;
+  const oks = statuses.filter((s) => s === "ok").length;
+  const skipped = total - oks - warnings;
   const canFinish = !!photoPreviewUrl && !submitting;
 
   return (
-    <div className="px-4 py-5 flex flex-col gap-5">
-      <div className="rounded-2xl p-4" style={{ background: "#1a1e2e", border: "1px solid #252d45" }}>
-        <div className="font-semibold mb-3" style={{ fontFamily: "Outfit", color: "#f0f2f8" }}>Resumen de revisión</div>
+    <div className="px-4 py-6 flex flex-col gap-6">
+      <div className="bg-white border border-slate-200 rounded-xl p-4">
+        <SectionTitle>Resumen de revisión</SectionTitle>
         <div className="grid grid-cols-2 gap-3">
-          <div className="rounded-xl px-3 py-3 text-center" style={{ background: "#0d2618" }}>
-            <div className="text-2xl font-bold" style={{ fontFamily: "Outfit", color: "#22c55e" }}>{oks}</div>
-            <div className="text-xs mt-0.5" style={{ color: "#22c55e" }}>Puntos OK</div>
+          <div className="rounded-lg px-3 py-3 text-center bg-emerald-50 border border-emerald-200">
+            <div className="text-2xl font-semibold text-emerald-600">{oks}</div>
+            <div className="text-xs font-mono uppercase tracking-wider text-emerald-600 mt-0.5">Puntos OK</div>
           </div>
-          <div className="rounded-xl px-3 py-3 text-center" style={{ background: warnings > 0 ? "#2d1f0a" : "#1e2540" }}>
-            <div className="text-2xl font-bold" style={{ fontFamily: "Outfit", color: warnings > 0 ? "#f59e0b" : "#6b7a99" }}>{warnings}</div>
-            <div className="text-xs mt-0.5" style={{ color: warnings > 0 ? "#f59e0b" : "#6b7a99" }}>Advertencias</div>
+          <div className={`rounded-lg px-3 py-3 text-center border ${warnings > 0 ? "bg-amber-50 border-amber-200" : "bg-slate-50 border-slate-200"}`}>
+            <div className={`text-2xl font-semibold ${warnings > 0 ? "text-amber-600" : "text-slate-400"}`}>{warnings}</div>
+            <div className={`text-xs font-mono uppercase tracking-wider mt-0.5 ${warnings > 0 ? "text-amber-600" : "text-slate-400"}`}>Advertencias</div>
           </div>
         </div>
+        {skipped > 0 && <p className="text-xs text-slate-500 mt-3 text-center">{skipped} punto{skipped > 1 ? "s" : ""} sin revisar (no obligatorio{skipped > 1 ? "s" : ""}).</p>}
+        <Btn variant="ghost" onClick={onBack} className="mt-3 w-full justify-center">
+          <ChevronLeftIcon className="w-4 h-4" />
+          Volver a la revisión
+        </Btn>
       </div>
 
-      <div className="rounded-2xl" style={{ background: "#1a1e2e", border: "1px solid #252d45", overflow: "hidden" }}>
+      <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <div className="px-4 pt-4 pb-3">
-          <div className="font-semibold" style={{ fontFamily: "Outfit", color: "#f0f2f8" }}>Foto del equipo</div>
-          <div className="text-sm mt-0.5" style={{ color: "#6b7a99" }}>Capture el estado actual del equipo como evidencia</div>
+          <div className="font-semibold text-slate-900">Foto del equipo</div>
+          <div className="text-sm mt-0.5 text-slate-500">Capture el estado actual del equipo como evidencia</div>
         </div>
 
         {photoPreviewUrl ? (
-          <div className="relative mx-4 mb-4 rounded-xl overflow-hidden" style={{ height: 220 }}>
+          <div className="relative mx-4 mb-4 rounded-lg overflow-hidden" style={{ height: 220 }}>
             <img src={photoPreviewUrl} alt="Equipo capturado" className="w-full h-full object-cover" />
             <button
               onClick={onFileInputClick}
-              className="absolute bottom-3 right-3 rounded-xl px-3 py-2 text-sm font-medium flex items-center gap-1.5"
-              style={{ background: "rgba(15,17,23,0.85)", color: "#38bdf8", border: "1px solid #38bdf8" }}
+              className="absolute bottom-3 right-3 rounded-lg px-3 py-2 text-sm font-medium flex items-center gap-1.5 bg-white/90 text-cyan-600 border border-cyan-500 cursor-pointer"
             >
               <CameraIcon className="w-4 h-4" />
               Cambiar
@@ -679,15 +968,15 @@ function PhotoStep({
         ) : (
           <button
             onClick={onFileInputClick}
-            className="mx-4 mb-4 w-[calc(100%-2rem)] rounded-xl flex flex-col items-center justify-center gap-3 transition-all active:scale-98"
-            style={{ background: "#0f1117", border: "2px dashed #252d45", height: 180 }}
+            className="mx-4 mb-4 w-[calc(100%-2rem)] rounded-lg flex flex-col items-center justify-center gap-3 transition-colors cursor-pointer bg-slate-50 hover:bg-slate-100 border-2 border-dashed border-slate-300"
+            style={{ height: 180 }}
           >
-            <div className="w-14 h-14 rounded-2xl flex items-center justify-center" style={{ background: "#1e2540" }}>
-              <CameraIcon className="w-7 h-7" style={{ color: "#38bdf8" }} />
+            <div className="w-14 h-14 rounded-xl bg-white border border-slate-200 flex items-center justify-center">
+              <CameraIcon className="w-7 h-7 text-cyan-600" />
             </div>
             <div>
-              <div className="text-sm font-semibold" style={{ color: "#f0f2f8" }}>Tomar o seleccionar foto</div>
-              <div className="text-xs mt-0.5 text-center" style={{ color: "#6b7a99" }}>JPG, PNG hasta 10 MB</div>
+              <div className="text-sm font-semibold text-slate-900">Tomar o seleccionar foto</div>
+              <div className="text-xs mt-0.5 text-center text-slate-500">JPG, PNG hasta 10 MB</div>
             </div>
           </button>
         )}
@@ -702,85 +991,64 @@ function PhotoStep({
         />
       </div>
 
-      {error && <p className="text-sm text-center" style={{ color: "#f59e0b" }}>{error}</p>}
+      {error && <p className="text-sm text-center text-red-600">{error}</p>}
 
-      <button
-        onClick={onFinish}
-        disabled={!canFinish}
-        className="w-full rounded-2xl py-4 font-bold text-lg flex items-center justify-center gap-2 transition-all active:scale-98 disabled:opacity-40"
-        style={{
-          background: canFinish ? "#38bdf8" : "#1e2540",
-          color: canFinish ? "#0c1520" : "#6b7a99",
-          fontFamily: "Outfit",
-        }}
-      >
-        <CheckCircleIcon className="w-6 h-6" />
+      <Btn onClick={onFinish} disabled={!canFinish} className="w-full justify-center py-3 text-base">
+        <CheckCircleIcon className="w-5 h-5" />
         {submitting ? "Guardando…" : "Cerrar revisión"}
-      </button>
+      </Btn>
     </div>
   );
 }
 
+
 // ─── Icons ────────────────────────────────────────────────────────────────────
 
-function SnowflakeIcon({ className, style }: { className?: string; style?: React.CSSProperties }) {
+function LocationIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <line x1="12" y1="2" x2="12" y2="22" />
-      <path d="M17 7l-5 5-5-5" />
-      <path d="M17 17l-5-5-5 5" />
-      <line x1="2" y1="12" x2="22" y2="12" />
-      <path d="M7 7L2 12l5 5" />
-      <path d="M17 7l5 5-5 5" />
-    </svg>
-  );
-}
-
-function LocationIcon({ className, style }: { className?: string; style?: React.CSSProperties }) {
-  return (
-    <svg className={className} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
       <circle cx="12" cy="10" r="3" />
     </svg>
   );
 }
 
-function ChevronRightIcon({ className, style }: { className?: string; style?: React.CSSProperties }) {
+function ChevronRightIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
       <polyline points="9 18 15 12 9 6" />
     </svg>
   );
 }
 
-function ChevronLeftIcon({ className, style }: { className?: string; style?: React.CSSProperties }) {
+function ChevronLeftIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
       <polyline points="15 18 9 12 15 6" />
     </svg>
   );
 }
 
-function CheckCircleIcon({ className, style }: { className?: string; style?: React.CSSProperties }) {
+function CheckCircleIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
       <polyline points="22 4 12 14.01 9 11.01" />
     </svg>
   );
 }
 
-function WrenchIcon({ className, style }: { className?: string; style?: React.CSSProperties }) {
+function WrenchIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
     </svg>
   );
 }
 
-function WarningIcon({ className, style }: { className?: string; style?: React.CSSProperties }) {
+function WarningIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
       <line x1="12" y1="9" x2="12" y2="13" />
       <line x1="12" y1="17" x2="12.01" y2="17" />
@@ -788,9 +1056,9 @@ function WarningIcon({ className, style }: { className?: string; style?: React.C
   );
 }
 
-function CameraIcon({ className, style }: { className?: string; style?: React.CSSProperties }) {
+function CameraIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
       <circle cx="12" cy="13" r="4" />
     </svg>

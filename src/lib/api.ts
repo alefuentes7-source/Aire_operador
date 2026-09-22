@@ -13,6 +13,7 @@ export interface EquipmentView {
   status: "pending" | "done";
   hasWarnings: boolean;
   completedAt: string | null;
+  maintenanceId: string | null;
 }
 
 export interface ReviewPointView {
@@ -65,17 +66,17 @@ export async function fetchEquipmentForOperator(clientIds: string[]): Promise<Eq
   const equipmentIds = equipment.map((e) => e.id);
   const { data: maintenances, error: mErr } = await supabase
     .from("maintenances")
-    .select("equipment_id, completed_at, overall_result")
+    .select("id, equipment_id, completed_at, overall_result")
     .in("equipment_id", equipmentIds)
     .eq("status", "completed")
     .order("completed_at", { ascending: false });
   if (mErr) throw mErr;
 
-  const latestCompletedByEquipment = new Map<string, { completed_at: string; overall_result: MaintenanceResult | null }>();
+  const latestCompletedByEquipment = new Map<string, { id: string; completed_at: string; overall_result: MaintenanceResult | null }>();
   for (const m of maintenances ?? []) {
     if (!m.completed_at) continue;
     if (!latestCompletedByEquipment.has(m.equipment_id)) {
-      latestCompletedByEquipment.set(m.equipment_id, { completed_at: m.completed_at, overall_result: m.overall_result });
+      latestCompletedByEquipment.set(m.equipment_id, { id: m.id, completed_at: m.completed_at, overall_result: m.overall_result });
     }
   }
 
@@ -95,8 +96,52 @@ export async function fetchEquipmentForOperator(clientIds: string[]): Promise<Eq
       status: isDone ? "done" : "pending",
       hasWarnings: isDone && latest!.overall_result !== "ok",
       completedAt: isDone ? latest!.completed_at : null,
+      maintenanceId: isDone ? latest!.id : null,
     };
   });
+}
+
+export interface MaintenanceDetailItem {
+  reviewPointId: string;
+  label: string;
+  description: string;
+  status: PointStatus;
+  comment: string;
+}
+
+export interface MaintenanceDetail {
+  completedAt: string | null;
+  overallResult: MaintenanceResult | null;
+  photoUrl: string | null;
+  items: MaintenanceDetailItem[];
+}
+
+export async function fetchMaintenanceDetail(maintenanceId: string): Promise<MaintenanceDetail> {
+  const [itemsRes, photosRes, maintenanceRes] = await Promise.all([
+    supabase
+      .from("maintenance_items")
+      .select("review_point_id, client_description, operator_description, status, comments, display_order")
+      .eq("maintenance_id", maintenanceId)
+      .order("display_order", { ascending: true }),
+    supabase.from("maintenance_photos").select("file_url").eq("maintenance_id", maintenanceId).limit(1),
+    supabase.from("maintenances").select("completed_at, overall_result").eq("id", maintenanceId).single(),
+  ]);
+  if (itemsRes.error) throw itemsRes.error;
+  if (photosRes.error) throw photosRes.error;
+  if (maintenanceRes.error) throw maintenanceRes.error;
+
+  return {
+    completedAt: maintenanceRes.data?.completed_at ?? null,
+    overallResult: maintenanceRes.data?.overall_result ?? null,
+    photoUrl: photosRes.data?.[0]?.file_url ?? null,
+    items: (itemsRes.data ?? []).map((it) => ({
+      reviewPointId: it.review_point_id,
+      label: it.client_description,
+      description: it.operator_description,
+      status: it.status,
+      comment: it.comments ?? "",
+    })),
+  };
 }
 
 export async function fetchReviewPoints(equipmentTypeId: string): Promise<ReviewPointView[]> {
@@ -135,55 +180,73 @@ export async function finishMaintenance(input: FinishMaintenanceInput): Promise<
       ? "warning"
       : "ok";
 
-  const { data: maintenance, error: mErr } = await supabase
+  // El cron del admin ya deja una mantención "pending" por equipo; se reutiliza
+  // esa fila. Un trigger en la base crea sus maintenance_items al insertarla.
+  const { data: openRows, error: openErr } = await supabase
     .from("maintenances")
-    .insert({
+    .select("id")
+    .eq("equipment_id", input.equipmentId)
+    .in("status", ["pending", "in_progress"])
+    .order("scheduled_date", { ascending: false })
+    .limit(1);
+  if (openErr) throw new Error(`Buscar mantención: ${openErr.message}`);
+
+  const existingId = openRows?.[0]?.id;
+  const maintenanceId = existingId ?? crypto.randomUUID();
+
+  // La foto se sube primero: si falla, no queda nada a medias en la base.
+  const ext = input.photoFile.name.split(".").pop() || "jpg";
+  const path = `${maintenanceId}/equipo.${ext}`;
+  const { error: uploadErr } = await supabase.storage.from("maintenance-photos").upload(path, input.photoFile, {
+    contentType: input.photoFile.type,
+    upsert: true,
+  });
+  if (uploadErr) throw new Error(`Subida de foto: ${uploadErr.message}`);
+
+  const { data: publicUrl } = supabase.storage.from("maintenance-photos").getPublicUrl(path);
+
+  if (!existingId) {
+    const { error: insErr } = await supabase.from("maintenances").insert({
+      id: maintenanceId,
       equipment_id: input.equipmentId,
       assigned_to: input.operatorId,
       scheduled_date: new Date().toISOString().slice(0, 10),
+      started_at: input.startedAt.toISOString(),
+      status: "in_progress",
+    });
+    if (insErr) throw new Error(`Registro de mantención: ${insErr.message}`);
+  }
+
+  const reviewedAt = new Date().toISOString();
+  const itemResults = await Promise.all(
+    input.items.map((item) =>
+      supabase
+        .from("maintenance_items")
+        .update({ status: item.status, comments: item.comment || null, reviewed_at: reviewedAt })
+        .eq("maintenance_id", maintenanceId)
+        .eq("review_point_id", item.reviewPointId)
+    )
+  );
+  const itemErr = itemResults.find((r) => r.error)?.error;
+  if (itemErr) throw new Error(`Puntos de revisión: ${itemErr.message}`);
+
+  const { error: photoErr } = await supabase.from("maintenance_photos").insert({
+    maintenance_id: maintenanceId,
+    review_point_id: null,
+    file_url: publicUrl.publicUrl,
+    photo_type: "evidence",
+  });
+  if (photoErr) throw new Error(`Registro de foto: ${photoErr.message}`);
+
+  const { error: doneErr } = await supabase
+    .from("maintenances")
+    .update({
+      assigned_to: input.operatorId,
       started_at: input.startedAt.toISOString(),
       completed_at: new Date().toISOString(),
       status: "completed",
       overall_result: overallResult,
     })
-    .select("id")
-    .single();
-  if (mErr) throw mErr;
-
-  const pointById = new Map(input.reviewPoints.map((p) => [p.id, p]));
-  const itemsPayload = input.items.map((item, index) => {
-    const point = pointById.get(item.reviewPointId)!;
-    return {
-      maintenance_id: maintenance.id,
-      review_point_id: item.reviewPointId,
-      code: point.code,
-      client_description: point.label,
-      operator_description: point.description,
-      display_order: index,
-      status: item.status,
-      comments: item.comment || null,
-      reviewed_at: new Date().toISOString(),
-    };
-  });
-
-  const { error: itemsErr } = await supabase.from("maintenance_items").insert(itemsPayload);
-  if (itemsErr) throw itemsErr;
-
-  const ext = input.photoFile.name.split(".").pop() || "jpg";
-  const path = `${maintenance.id}/equipo.${ext}`;
-  const { error: uploadErr } = await supabase.storage.from("maintenance-photos").upload(path, input.photoFile, {
-    upsert: true,
-    contentType: input.photoFile.type,
-  });
-  if (uploadErr) throw uploadErr;
-
-  const { data: publicUrl } = supabase.storage.from("maintenance-photos").getPublicUrl(path);
-
-  const { error: photoErr } = await supabase.from("maintenance_photos").insert({
-    maintenance_id: maintenance.id,
-    review_point_id: null,
-    file_url: publicUrl.publicUrl,
-    photo_type: "equipo",
-  });
-  if (photoErr) throw photoErr;
+    .eq("id", maintenanceId);
+  if (doneErr) throw new Error(`Cerrar mantención: ${doneErr.message}`);
 }
