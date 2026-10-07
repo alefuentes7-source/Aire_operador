@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useAuth } from "./lib/auth";
+import { useSimulatedDate, localDateString } from "./lib/simulatedDate";
 import {
   fetchEquipmentForOperator,
   fetchReviewPoints,
@@ -237,18 +238,20 @@ function AuthenticatedApp({
   const [view, setView] = useState<View>("list");
   const [selectedEquipment, setSelectedEquipment] = useState<EquipmentView | null>(null);
 
+  const { getNow } = useSimulatedDate();
+
   const reload = useCallback(async () => {
     setLoadingEquipment(true);
     setLoadError(null);
     try {
-      const list = await fetchEquipmentForOperator(clientIds);
+      const list = await fetchEquipmentForOperator(clientIds, getNow());
       setEquipmentList(list);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "No se pudo cargar los equipos.");
     } finally {
       setLoadingEquipment(false);
     }
-  }, [clientIds]);
+  }, [clientIds, getNow]);
 
   useEffect(() => {
     reload();
@@ -309,6 +312,15 @@ function AuthenticatedApp({
   return <ListView equipmentList={equipmentList} operatorEmail={operatorEmail} onSelect={handleSelect} onSignOut={onSignOut} />;
 }
 
+function SimulationBanner({ now }: { now: Date }) {
+  return (
+    <div className="bg-amber-50 border-b border-amber-200 text-amber-800 text-xs text-center py-1.5 px-4">
+      Modo prueba: la app funciona como si hoy fuera {now.toLocaleDateString("es-CL", { day: "2-digit", month: "long", year: "numeric" })}.
+      Las revisiones que cierres se guardarán con esa fecha.
+    </div>
+  );
+}
+
 function ListView({
   equipmentList,
   operatorEmail,
@@ -322,19 +334,33 @@ function ListView({
 }) {
   const pending = equipmentList.filter((e) => e.status === "pending");
   const done = equipmentList.filter((e) => e.status === "done");
-  const today = new Date().toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long" });
+  const { simulatedDate, setSimulatedDate, getNow } = useSimulatedDate();
+  const now = getNow();
+  const today = now.toLocaleDateString("es-CL", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
 
   return (
     <Shell>
       <header className="sticky top-0 z-10 bg-slate-50/90 backdrop-blur border-b border-slate-200">
-        <div className="max-w-2xl mx-auto px-4 py-3 flex items-center gap-3">
+        <div className="max-w-2xl mx-auto px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-2">
           <span className="font-semibold text-slate-900 text-sm">Mantención A/C</span>
-          <div className="ml-auto flex items-center gap-3">
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+            {simulatedDate && <Badge className="text-amber-600 bg-amber-50 border-amber-200">Simulado</Badge>}
+            <input
+              type="date"
+              value={localDateString(now)}
+              onChange={(e) => setSimulatedDate(e.target.value || null)}
+              title="Simular la fecha actual (para pruebas)"
+              className="text-xs bg-slate-100 border border-slate-300 rounded px-2 py-1 text-slate-700 focus:outline-none focus:border-cyan-500 cursor-pointer"
+            />
+            {simulatedDate && (
+              <Btn variant="ghost" onClick={() => setSimulatedDate(null)} className="text-xs">Hoy</Btn>
+            )}
             <span className="text-xs text-slate-500 hidden sm:inline">{operatorEmail}</span>
             <Btn variant="ghost" onClick={onSignOut} className="text-xs">Cerrar sesión</Btn>
           </div>
         </div>
       </header>
+      {simulatedDate && <SimulationBanner now={now} />}
 
       <main className="max-w-2xl mx-auto px-4 py-6">
         <HeroBanner subtitle={today} />
@@ -453,7 +479,10 @@ function DetailView({ equipment, onBack }: { equipment: EquipmentView; onBack: (
         if (!cancelled) setDetail(d);
       })
       .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : "No se pudo cargar la revisión.");
+        if (!cancelled) {
+          const msg = err && typeof err === "object" && "message" in err ? String((err as { message: unknown }).message) : "";
+          setError(`No se pudo cargar la revisión${msg ? `: ${msg}` : "."}`);
+        }
       });
     return () => {
       cancelled = true;
@@ -508,16 +537,21 @@ function DetailView({ equipment, onBack }: { equipment: EquipmentView; onBack: (
             </div>
 
             {detail.photoUrl && (
-              <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-                <img src={detail.photoUrl} alt="Foto del equipo" className="w-full object-cover" style={{ maxHeight: 320 }} />
+              <div className="bg-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+                <img src={detail.photoUrl} alt="Foto del equipo" className="w-full object-contain" style={{ maxHeight: 360 }} />
               </div>
             )}
 
             <div>
               <SectionTitle>Puntos revisados</SectionTitle>
+              {detail.items.length === 0 && (
+                <p className="text-sm text-slate-500 bg-white border border-slate-200 rounded-lg p-3">
+                  No hay puntos de revisión registrados para esta revisión.
+                </p>
+              )}
               <div className="flex flex-col gap-2">
-                {detail.items.map((item) => (
-                  <div key={item.reviewPointId} className="bg-white border border-slate-200 rounded-lg p-3">
+                {detail.items.map((item, i) => (
+                  <div key={`${item.reviewPointId}-${i}`} className="bg-white border border-slate-200 rounded-lg p-3">
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-sm font-medium text-slate-900">{item.label}</span>
                       <Badge className={item.status === "ok" ? "text-emerald-600 bg-emerald-50 border-emerald-200" : "text-amber-600 bg-amber-50 border-amber-200"}>
@@ -536,7 +570,7 @@ function DetailView({ equipment, onBack }: { equipment: EquipmentView; onBack: (
   );
 }
 
-type WizardStep = "loading" | "checks" | "photo" | "error";
+type WizardStep = "loading" | "checks" | "photo" | "error" | "empty";
 
 function WizardView({
   equipment,
@@ -559,7 +593,8 @@ function WizardView({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const startedAtRef = useRef(initialSnapshot ? new Date(initialSnapshot.startedAt) : new Date());
+  const { simulatedDate, getNow } = useSimulatedDate();
+  const startedAtRef = useRef(initialSnapshot ? new Date(initialSnapshot.startedAt) : getNow());
 
   useEffect(() => {
     let cancelled = false;
@@ -567,6 +602,10 @@ function WizardView({
       .then((points) => {
         if (cancelled) return;
         setReviewPoints(points);
+        if (points.length === 0) {
+          setStep("empty");
+          return;
+        }
         setStep(initialSnapshot?.step === "photo" ? "photo" : "checks");
       })
       .catch((err) => {
@@ -646,6 +685,7 @@ function WizardView({
         equipmentId: equipment.id,
         operatorId,
         startedAt: startedAtRef.current,
+        now: getNow(),
         items: reviewPoints
           .filter((p) => answers[p.id]?.status)
           .map((p) => ({ reviewPointId: p.id, status: answers[p.id].status as PointStatus, comment: answers[p.id].comment })),
@@ -681,7 +721,7 @@ function WizardView({
             <span>{equipment.location}</span>
           </div>
 
-          {step !== "loading" && step !== "error" && (
+          {step !== "loading" && step !== "error" && step !== "empty" && (
             <div className="flex items-center gap-2 mt-4">
               <StepDot active={step === "checks"} done={step === "photo"} label="Revisión" />
               <div className={`flex-1 h-px ${step === "photo" ? "bg-cyan-500" : "bg-slate-300"}`} />
@@ -690,9 +730,22 @@ function WizardView({
           )}
         </div>
       </header>
+      {simulatedDate && <SimulationBanner now={getNow()} />}
 
       <main className="max-w-2xl mx-auto">
         {step === "loading" && <div className="text-center py-16 text-slate-500 text-sm font-mono">Cargando puntos de revisión…</div>}
+        {step === "empty" && (
+          <div className="text-center py-16 px-4">
+            <div className="w-12 h-12 mx-auto mb-4 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-center">
+              <WarningIcon className="w-6 h-6 text-amber-600" />
+            </div>
+            <p className="font-semibold text-slate-900 mb-1">Este equipo no tiene puntos de revisión</p>
+            <p className="text-sm text-slate-500 mb-6">
+              Aún no se han configurado puntos de revisión para este tipo de equipo. Avisa a un administrador para que los agregue.
+            </p>
+            <Btn variant="ghost" onClick={onBack}>Volver</Btn>
+          </div>
+        )}
         {step === "error" && (
           <div className="text-center py-16 px-4">
             <p className="mb-4 text-red-600 text-sm">{error}</p>

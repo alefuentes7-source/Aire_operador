@@ -1,5 +1,6 @@
 import { supabase } from "./supabaseClient";
-import { lastDueDate } from "./period";
+import { dueThisMonth } from "./period";
+import { localDateString } from "./simulatedDate";
 import type { MaintenanceResult, PointStatus } from "./database.types";
 
 export interface EquipmentView {
@@ -26,7 +27,7 @@ export interface ReviewPointView {
   commentsAllowed: boolean;
 }
 
-export async function fetchEquipmentForOperator(clientIds: string[]): Promise<EquipmentView[]> {
+export async function fetchEquipmentForOperator(clientIds: string[], today: Date): Promise<EquipmentView[]> {
   if (clientIds.length === 0) return [];
 
   const { data: types, error: typesErr } = await supabase
@@ -45,10 +46,9 @@ export async function fetchEquipmentForOperator(clientIds: string[]): Promise<Eq
     .eq("active", true);
   if (plansErr) throw plansErr;
 
-  const today = new Date();
   const dueDateByType = new Map<string, Date>();
   for (const plan of plans ?? []) {
-    const due = lastDueDate(plan, today);
+    const due = dueThisMonth(plan, today);
     if (due) dueDateByType.set(plan.equipment_type_id, due);
   }
 
@@ -72,18 +72,24 @@ export async function fetchEquipmentForOperator(clientIds: string[]): Promise<Eq
     .order("completed_at", { ascending: false });
   if (mErr) throw mErr;
 
-  const latestCompletedByEquipment = new Map<string, { id: string; completed_at: string; overall_result: MaintenanceResult | null }>();
+  // Última revisión completada DENTRO del mes que toca (así, al simular otra
+  // fecha, una revisión de otro mes no cuenta como realizada).
+  const typeByEquipment = new Map(equipment.map((e) => [e.id, e.equipment_type_id]));
+  const completedInWindow = new Map<string, { id: string; completed_at: string; overall_result: MaintenanceResult | null }>();
   for (const m of maintenances ?? []) {
-    if (!m.completed_at) continue;
-    if (!latestCompletedByEquipment.has(m.equipment_id)) {
-      latestCompletedByEquipment.set(m.equipment_id, { id: m.id, completed_at: m.completed_at, overall_result: m.overall_result });
+    if (!m.completed_at || completedInWindow.has(m.equipment_id)) continue;
+    const due = dueDateByType.get(typeByEquipment.get(m.equipment_id)!);
+    if (!due) continue;
+    const completedAt = new Date(m.completed_at);
+    const windowEnd = new Date(due.getFullYear(), due.getMonth() + 1, 1);
+    if (completedAt >= due && completedAt < windowEnd) {
+      completedInWindow.set(m.equipment_id, { id: m.id, completed_at: m.completed_at, overall_result: m.overall_result });
     }
   }
 
   return equipment.map((e): EquipmentView => {
-    const due = dueDateByType.get(e.equipment_type_id)!;
-    const latest = latestCompletedByEquipment.get(e.id);
-    const isDone = !!latest && new Date(latest.completed_at) >= due;
+    const latest = completedInWindow.get(e.id);
+    const isDone = !!latest;
 
     return {
       id: e.id,
@@ -168,6 +174,7 @@ export interface FinishMaintenanceInput {
   equipmentId: string;
   operatorId: string;
   startedAt: Date;
+  now: Date;
   items: { reviewPointId: string; status: PointStatus; comment: string }[];
   reviewPoints: ReviewPointView[];
   photoFile: File;
@@ -181,7 +188,8 @@ export async function finishMaintenance(input: FinishMaintenanceInput): Promise<
       : "ok";
 
   // El cron del admin ya deja una mantención "pending" por equipo; se reutiliza
-  // esa fila. Un trigger en la base crea sus maintenance_items al insertarla.
+  // esa fila. Un trigger en la base crea sus maintenance_items al insertarla,
+  // pero solo con los puntos que existían en ese momento.
   const { data: openRows, error: openErr } = await supabase
     .from("maintenances")
     .select("id")
@@ -205,30 +213,56 @@ export async function finishMaintenance(input: FinishMaintenanceInput): Promise<
 
   const { data: publicUrl } = supabase.storage.from("maintenance-photos").getPublicUrl(path);
 
-  if (!existingId) {
+  if (existingId) {
+    // Con RLS, un UPDATE sin permiso no da error: simplemente no toca ninguna fila.
+    const { data: claimed, error: claimErr } = await supabase
+      .from("maintenances")
+      .update({ assigned_to: input.operatorId, started_at: input.startedAt.toISOString(), status: "in_progress" })
+      .eq("id", maintenanceId)
+      .select("id");
+    if (claimErr) throw new Error(`Tomar mantención: ${claimErr.message}`);
+    if (!claimed || claimed.length === 0) {
+      throw new Error("Tomar mantención: sin permiso para actualizarla (falta correr supabase/operator-updates.sql)");
+    }
+  } else {
     const { error: insErr } = await supabase.from("maintenances").insert({
       id: maintenanceId,
       equipment_id: input.equipmentId,
       assigned_to: input.operatorId,
-      scheduled_date: new Date().toISOString().slice(0, 10),
+      scheduled_date: localDateString(input.now),
       started_at: input.startedAt.toISOString(),
       status: "in_progress",
     });
     if (insErr) throw new Error(`Registro de mantención: ${insErr.message}`);
   }
 
-  const reviewedAt = new Date().toISOString();
-  const itemResults = await Promise.all(
-    input.items.map((item) =>
-      supabase
-        .from("maintenance_items")
-        .update({ status: item.status, comments: item.comment || null, reviewed_at: reviewedAt })
-        .eq("maintenance_id", maintenanceId)
-        .eq("review_point_id", item.reviewPointId)
-    )
-  );
-  const itemErr = itemResults.find((r) => r.error)?.error;
-  if (itemErr) throw new Error(`Puntos de revisión: ${itemErr.message}`);
+  // Upsert: actualiza los puntos que el trigger ya creó y crea los que falten
+  // (por ejemplo puntos agregados después de agendar la mantención).
+  const pointById = new Map(input.reviewPoints.map((p) => [p.id, p]));
+  const reviewedAt = input.now.toISOString();
+  const itemsPayload = input.items.map((item, index) => {
+    const point = pointById.get(item.reviewPointId)!;
+    return {
+      maintenance_id: maintenanceId,
+      review_point_id: item.reviewPointId,
+      code: point.code,
+      client_description: point.label,
+      operator_description: point.description,
+      display_order: index,
+      status: item.status,
+      comments: item.comment || null,
+      reviewed_at: reviewedAt,
+    };
+  });
+
+  const { data: savedItems, error: itemsErr } = await supabase
+    .from("maintenance_items")
+    .upsert(itemsPayload, { onConflict: "maintenance_id,review_point_id" })
+    .select("id");
+  if (itemsErr) throw new Error(`Puntos de revisión: ${itemsErr.message}`);
+  if ((savedItems?.length ?? 0) !== itemsPayload.length) {
+    throw new Error("Puntos de revisión: no se pudieron guardar todos (revisa los permisos de maintenance_items)");
+  }
 
   const { error: photoErr } = await supabase.from("maintenance_photos").insert({
     maintenance_id: maintenanceId,
@@ -238,15 +272,17 @@ export async function finishMaintenance(input: FinishMaintenanceInput): Promise<
   });
   if (photoErr) throw new Error(`Registro de foto: ${photoErr.message}`);
 
-  const { error: doneErr } = await supabase
+  const { data: closed, error: doneErr } = await supabase
     .from("maintenances")
     .update({
-      assigned_to: input.operatorId,
-      started_at: input.startedAt.toISOString(),
-      completed_at: new Date().toISOString(),
+      completed_at: input.now.toISOString(),
       status: "completed",
       overall_result: overallResult,
     })
-    .eq("id", maintenanceId);
+    .eq("id", maintenanceId)
+    .select("id");
   if (doneErr) throw new Error(`Cerrar mantención: ${doneErr.message}`);
+  if (!closed || closed.length === 0) {
+    throw new Error("Cerrar mantención: sin permiso para actualizarla (falta correr supabase/operator-updates.sql)");
+  }
 }

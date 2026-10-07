@@ -1,17 +1,11 @@
 /**
- * Un equipo queda "pendiente" desde el 1er día del último mes de ciclo que ya
- * pasó (según start_month/start_year + frequency_months del plan) hasta que
- * exista una maintenance completada con completed_at >= esa fecha. Así un
- * equipo atrasado sigue apareciendo como pendiente en vez de desaparecer al
- * cambiar de mes.
+ * Un equipo aparece en la lista del operador solo en los meses en que le toca
+ * mantención según su plan (start_month/start_year + frequency_months). Mismo
+ * criterio que el calendario del panel admin. Devuelve el 1er día del mes
+ * actual si toca, o null si no.
  */
-export function lastDueDate(plan: { frequency_months: number; start_month: number; start_year: number }, today = new Date()): Date | null {
-  const start = new Date(plan.start_year, plan.start_month - 1, 1);
-  if (start > today) return null;
-
-  const monthsSinceStart = (today.getFullYear() - start.getFullYear()) * 12 + (today.getMonth() - start.getMonth());
-  const cyclesElapsed = Math.floor(monthsSinceStart / plan.frequency_months);
-  const dueMonthsOffset = cyclesElapsed * plan.frequency_months;
-
-  return new Date(start.getFullYear(), start.getMonth() + dueMonthsOffset, 1);
+export function dueThisMonth(plan: { frequency_months: number; start_month: number; start_year: number }, today = new Date()): Date | null {
+  const offset = (today.getFullYear() - plan.start_year) * 12 + (today.getMonth() + 1 - plan.start_month);
+  if (offset < 0 || offset % plan.frequency_months !== 0) return null;
+  return new Date(today.getFullYear(), today.getMonth(), 1);
 }
