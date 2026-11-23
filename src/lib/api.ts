@@ -15,6 +15,9 @@ export interface EquipmentView {
   hasWarnings: boolean;
   completedAt: string | null;
   maintenanceId: string | null;
+  clientName: string;
+  clientLogoUrl: string;
+  reviewPointCount: number;
 }
 
 export interface ReviewPointView {
@@ -37,6 +40,14 @@ export async function fetchEquipmentForOperator(clientIds: string[], today: Date
     .eq("active", true);
   if (typesErr) throw typesErr;
   if (!types || types.length === 0) return [];
+
+  const { data: clients, error: clientsErr } = await supabase
+    .from("clients")
+    .select("id, name, logo_url")
+    .in("id", clientIds);
+  if (clientsErr) throw clientsErr;
+  const clientById = new Map((clients ?? []).map((c) => [c.id, c]));
+  const clientByType = new Map(types.map((t) => [t.id, clientById.get(t.client_id)]));
 
   const typeIds = types.map((t) => t.id);
   const { data: plans, error: plansErr } = await supabase
@@ -62,6 +73,17 @@ export async function fetchEquipmentForOperator(clientIds: string[], today: Date
     .eq("active", true);
   if (eqErr) throw eqErr;
   if (!equipment || equipment.length === 0) return [];
+
+  const { data: points, error: pointsErr } = await supabase
+    .from("review_points")
+    .select("equipment_type_id")
+    .in("equipment_type_id", dueTypeIds)
+    .eq("active", true);
+  if (pointsErr) throw pointsErr;
+  const pointCountByType = new Map<string, number>();
+  for (const p of points ?? []) {
+    pointCountByType.set(p.equipment_type_id, (pointCountByType.get(p.equipment_type_id) ?? 0) + 1);
+  }
 
   const equipmentIds = equipment.map((e) => e.id);
   const { data: maintenances, error: mErr } = await supabase
@@ -103,6 +125,9 @@ export async function fetchEquipmentForOperator(clientIds: string[], today: Date
       hasWarnings: isDone && latest!.overall_result !== "ok",
       completedAt: isDone ? latest!.completed_at : null,
       maintenanceId: isDone ? latest!.id : null,
+      clientName: clientByType.get(e.equipment_type_id)?.name ?? "",
+      clientLogoUrl: clientByType.get(e.equipment_type_id)?.logo_url ?? "",
+      reviewPointCount: pointCountByType.get(e.equipment_type_id) ?? 0,
     };
   });
 }

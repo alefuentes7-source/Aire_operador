@@ -95,6 +95,28 @@ function Badge({ children, className = "" }: { children: React.ReactNode; classN
   );
 }
 
+function BrandLogo({ className = "h-8" }: { className?: string }) {
+  return <img src="/brand/maseo.png" alt="MASEO" className={`${className} w-auto`} />;
+}
+
+function clientInitials(name: string) {
+  return name.split(" ").filter(Boolean).slice(0, 2).map((w) => w[0]).join("").toUpperCase();
+}
+
+// Logo del cliente (se carga desde el panel admin). Sin logo, muestra iniciales.
+function ClientLogo({ name, logoUrl, className = "w-14 h-14" }: { name: string; logoUrl: string; className?: string }) {
+  if (!name && !logoUrl) return null;
+  return (
+    <div className={`${className} rounded-lg bg-white border border-slate-200 flex items-center justify-center overflow-hidden shrink-0`} title={name}>
+      {logoUrl ? (
+        <img src={logoUrl} alt={name} className="w-full h-full object-contain p-1" />
+      ) : (
+        <span className="text-xs font-semibold text-slate-500">{clientInitials(name)}</span>
+      )}
+    </div>
+  );
+}
+
 function Btn({
   children,
   onClick,
@@ -200,8 +222,8 @@ function LoginScreen({ onSignIn }: { onSignIn: (email: string, password: string)
       <div className="min-h-screen flex items-center justify-center p-4">
         <form onSubmit={handleSubmit} className="w-full max-w-sm bg-white border border-slate-200 rounded-xl p-6 flex flex-col gap-4">
           <div className="mb-2">
-            <span className="font-semibold text-slate-900 text-lg">Mantención A/C</span>
-            <p className="text-xs text-slate-500 mt-0.5">Panel de operadores</p>
+            <BrandLogo className="h-14 rounded-lg" />
+            <p className="text-xs text-slate-500 mt-2">Mantención A/C · Panel de operadores</p>
           </div>
           <div>
             <FieldLabel>Email</FieldLabel>
@@ -342,7 +364,10 @@ function ListView({
     <Shell>
       <header className="sticky top-0 z-10 bg-slate-50/90 backdrop-blur border-b border-slate-200">
         <div className="max-w-2xl mx-auto px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-2">
-          <span className="font-semibold text-slate-900 text-sm">Mantención A/C</span>
+          <div className="flex items-center gap-2">
+            <BrandLogo className="h-8 rounded" />
+            <span className="font-semibold text-slate-900 text-sm hidden sm:inline">Mantención A/C</span>
+          </div>
           <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
             {simulatedDate && <Badge className="text-amber-600 bg-amber-50 border-amber-200">Simulado</Badge>}
             <input
@@ -425,7 +450,8 @@ function EquipmentCard({ equipment: eq, onSelect }: { equipment: EquipmentView; 
         isPending ? "" : "opacity-75"
       }`}
     >
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex items-start gap-3">
+        <ClientLogo name={eq.clientName} logoUrl={eq.clientLogoUrl} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1.5">
             <Badge className="text-slate-600 bg-slate-100 border-slate-200">{eq.code}</Badge>
@@ -445,6 +471,16 @@ function EquipmentCard({ equipment: eq, onSelect }: { equipment: EquipmentView; 
             <LocationIcon className="w-3.5 h-3.5 flex-shrink-0 text-slate-400" />
             <span className="truncate">{eq.location}</span>
           </div>
+          {isPending && (
+            <div className={`flex items-center gap-1.5 mt-1 text-sm ${eq.reviewPointCount > 0 ? "text-slate-600" : "text-amber-600"}`}>
+              <WrenchIcon className={`w-3.5 h-3.5 flex-shrink-0 ${eq.reviewPointCount > 0 ? "text-slate-400" : "text-amber-500"}`} />
+              <span>
+                {eq.reviewPointCount === 0
+                  ? "Sin puntos de revisión"
+                  : `${eq.reviewPointCount} punto${eq.reviewPointCount !== 1 ? "s" : ""} de revisión`}
+              </span>
+            </div>
+          )}
           {!isPending && completedAtLabel && (
             <div className="flex items-center gap-1.5 mt-1 text-xs text-emerald-600">
               <CheckCircleIcon className="w-3.5 h-3.5 flex-shrink-0" />
@@ -509,10 +545,11 @@ function DetailView({ equipment, onBack }: { equipment: EquipmentView; onBack: (
               <Badge className="text-slate-600 bg-slate-100 border-slate-200">{equipment.code}</Badge>
               <div className="font-semibold text-slate-900 leading-tight truncate mt-1">{equipment.description}</div>
             </div>
+            <ClientLogo name={equipment.clientName} logoUrl={equipment.clientLogoUrl} className="w-12 h-12" />
           </div>
           <div className="flex items-center gap-1.5 mt-2 text-xs text-slate-500">
             <LocationIcon className="w-3.5 h-3.5 text-slate-400" />
-            <span>{equipment.location}</span>
+            <span>{equipment.clientName ? `${equipment.clientName} · ` : ""}{equipment.location}</span>
           </div>
         </div>
       </header>
@@ -715,10 +752,11 @@ function WizardView({
               <Badge className="text-slate-600 bg-slate-100 border-slate-200">{equipment.code}</Badge>
               <div className="font-semibold text-slate-900 leading-tight truncate mt-1">{equipment.description}</div>
             </div>
+            <ClientLogo name={equipment.clientName} logoUrl={equipment.clientLogoUrl} className="w-12 h-12" />
           </div>
           <div className="flex items-center gap-1.5 mt-2 text-xs text-slate-500">
             <LocationIcon className="w-3.5 h-3.5 text-slate-400" />
-            <span>{equipment.location}</span>
+            <span>{equipment.clientName ? `${equipment.clientName} · ` : ""}{equipment.location}</span>
           </div>
 
           {step !== "loading" && step !== "error" && step !== "empty" && (
